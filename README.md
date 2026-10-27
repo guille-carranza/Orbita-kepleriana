@@ -1,2 +1,3 @@
-# Orbita-kepleriana
-Proyecto integrador de análisis matemático II. Ecuación de una óribta kepleriana
+*Grupo 3*\
+Integrantes: Felipe Albanesi, Guillermo Carranza.\
+Comisión: 17-21
