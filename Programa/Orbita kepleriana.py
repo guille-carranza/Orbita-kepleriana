@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+from matplotlib.patches import Arc
 # ----------------------------------------------------------------------------
 # Configuración
 # ----------------------------------------------------------------------------
@@ -261,6 +261,150 @@ def graficar_orbita_polar(parametros, x_obs, y_obs, theta_r_deg=60.0, guardar_co
     if guardar_como:
         fig.savefig(guardar_como, dpi=200)
     return fig, ax
+
+
+# ----------------------------------------------------------------------------
+# Función 3: sistema original (x, y) y sistema rotado (x', y'), focos y ejes
+# ----------------------------------------------------------------------------
+def a_sistema_original(xp, yp, alpha_deg, h, k):
+    """
+    Del sistema rotado (x', y') al original (x, y):  primero se rota en α y luego se traslada a (h, k).
+        x = h + x' cos α − y' sin α
+        y = k + x' sin α + y' cos α
+    """
+    alpha = np.deg2rad(alpha_deg)
+    x = h + xp * np.cos(alpha) - yp * np.sin(alpha)
+    y = k + xp * np.sin(alpha) + yp * np.cos(alpha)
+    return x, y
+ 
+ 
+def a_sistema_rotado(x, y, alpha_deg, h, k):
+    """
+    Del sistema original (x, y) al rotado (x', y') con origen en el foco (h, k):  es la inversa de
+    a_sistema_original (se resta (h, k) y se rota en −α). El eje x' apunta al perihelio.
+        x' =  (x − h) cos α + (y − k) sin α
+        y' = −(x − h) sin α + (y − k) cos α
+    """
+    alpha = np.deg2rad(alpha_deg)
+    dx, dy = x - h, y - k
+    xp = dx * np.cos(alpha) + dy * np.sin(alpha)
+    yp = -dx * np.sin(alpha) + dy * np.cos(alpha)
+    return xp, yp
+ 
+
+def error_radial_rms(parametros, x_obs, y_obs):
+    """RMS de (r_obs − r_modelo(θ_obs)) en UA: sirve para chequear que el α del CSV encaja con los datos."""
+    theta_obs, r_obs = observaciones_a_polares(x_obs, y_obs, parametros)
+    r_modelo = radio_orbita(theta_obs, parametros["p"], parametros["e"])
+    return float(np.sqrt(np.mean((r_obs - r_modelo) ** 2)))
+ 
+ 
+def graficar_sistema_rotado(parametros, x_obs, y_obs, guardar_como=None):
+    """
+    Visualización del foco, los ejes y el sistema rotado. Dibuja a la vez:
+      - sistema original (x, y), con origen en (0, 0)       -> ejes grises punteados
+      - sistema rotado (x', y'): MISMO origen (0, 0), solo rotado en α (sin traslación)
+                                                            -> ejes negros con flechas
+      - los focos de la elipse (F1 = (h, k) y F2, solo si e < 1)
+      - los ejes de la elipse (mayor y menor), paralelos a x' e y'
+      - el ángulo de rotación α (de x a x', antihorario) marcado con un arco
+    El ángulo de rotación es α = alpha_2D_deg del CSV.
+    """
+    p, e, a = parametros["p"], parametros["e"], parametros["a"]
+    alpha, h, k = parametros["alpha_deg"], parametros["h"], parametros["k"]
+    q, Q = parametros["q"], parametros["Q"]
+ 
+    x_orb, y_orb = orbita_cartesiana(p, e, alpha, h, k)
+    x_per, y_per = punto_en_orbita(q, 0.0, alpha, h, k)
+    x_afe, y_afe = punto_en_orbita(Q, np.pi, alpha, h, k)
+ 
+    alpha_r = np.deg2rad(alpha)
+    u = np.array([np.cos(alpha_r), np.sin(alpha_r)])      # dirección de x'
+    v = np.array([-np.sin(alpha_r), np.cos(alpha_r)])     # dirección de y'
+    origen = np.array([0.0, 0.0])
+ 
+    # Largo de los ejes del sistema: algo mayor que la órbita
+    L = 1.25 * (Q if e < 1.0 else 3.0 * q)
+ 
+    fig, ax = plt.subplots(figsize=(8, 8))
+ 
+    # Órbita y datos
+    ax.plot(x_orb, y_orb, color="tab:blue", lw=2,
+            label=f"Órbita teórica  (e={e:.4f}, p={p:.4f} UA)")
+    ax.scatter(x_obs, y_obs, s=30, color="tab:red", edgecolor="k", zorder=3,
+               label=f"Observaciones ({len(x_obs)})")
+ 
+    # Ejes de la elipse (solo órbitas cerradas): pasan por el centro, paralelos a x' e y'
+    if e < 1.0:
+        c = a * e
+        b = a * np.sqrt(1.0 - e**2)
+        xc, yc = a_sistema_original(-c, 0.0, alpha, h, k)           # centro de la elipse
+        centro = np.array([xc, yc])
+        ax.plot(*zip(centro - a * u, centro + a * u), color="tab:green", ls=":", lw=1.6,
+                label="Ejes de la elipse (mayor y menor)")
+        ax.plot(*zip(centro - b * v, centro + b * v), color="tab:green", ls=":", lw=1.6)
+ 
+    # Sistema original (x, y): ejes grises punteados por el origen
+    ax.plot([-L, L], [0, 0], color="gray", ls="--", lw=1.2, alpha=0.8,
+            label="Sistema original (x, y)")
+    ax.plot([0, 0], [-L, L], color="gray", ls="--", lw=1.2, alpha=0.8)
+    for punta, texto in (((L, 0.0), "$x$"), ((0.0, L), "$y$")):
+        ax.annotate("", xy=punta, xytext=(0, 0), zorder=5,
+                    arrowprops=dict(arrowstyle="-|>", color="gray", lw=1.4))
+        ax.annotate(texto, xy=punta, xytext=(6, 6), textcoords="offset points",
+                    color="dimgray", fontsize=14)
+ 
+    # Sistema rotado (x', y'): mismo origen, ejes negros
+    ax.plot(*zip(origen - L * u, origen + L * u), color="black", lw=1.2, alpha=0.8,
+            label="Sistema rotado (x′, y′)")
+    ax.plot(*zip(origen - L * v, origen + L * v), color="black", lw=1.2, alpha=0.8)
+    for punta, texto in ((origen + L * u, "$x'$"), (origen + L * v, "$y'$")):
+        ax.annotate("", xy=tuple(punta), xytext=tuple(origen), zorder=5,
+                    arrowprops=dict(arrowstyle="-|>", color="black", lw=1.6))
+        ax.annotate(texto, xy=tuple(punta), xytext=(6, 6), textcoords="offset points",
+                    color="black", fontsize=14)
+ 
+    # Ángulo α entre x y x' (arco centrado en el origen)
+    alpha_disp = (alpha + 180.0) % 360.0 - 180.0          # llevado a (−180°, 180°]
+    r_arco = 0.3 * L
+    ax.add_patch(Arc((0.0, 0.0), 2 * r_arco, 2 * r_arco, angle=0.0,
+                     theta1=min(0.0, alpha_disp), theta2=max(0.0, alpha_disp),
+                     color="tab:orange", lw=2))
+    medio = np.deg2rad(alpha_disp / 2.0)
+    ax.annotate(f"α = {alpha:.1f}°",
+                xy=(1.12 * r_arco * np.cos(medio), 1.12 * r_arco * np.sin(medio)),
+                color="tab:orange", fontsize=12, ha="left", va="center", fontweight="bold")
+ 
+    # Focos, perihelio y afelio
+    ax.scatter([h], [k], marker="o", s=40, color="gold", edgecolor="k", zorder=6,
+               label=f"Foco F₁ = (h, k) = ({h:.3f}, {k:.3f})")
+    if e < 1.0:
+        x_f2, y_f2 = a_sistema_original(-2.0 * a * e, 0.0, alpha, h, k)
+        ax.scatter([x_f2], [y_f2], marker="o", s=40, color="tab:cyan", edgecolor="k", zorder=6,
+                   label=f"Foco F₂ = ({x_f2:.3f}, {y_f2:.3f})")
+        ax.scatter([x_afe], [y_afe], marker="s", s=60, color="tab:purple", edgecolor="k",
+                   zorder=4, label=f"Afelio Q = {Q:.4f} UA")
+    ax.scatter([x_per], [y_per], marker="D", s=60, color="tab:green", edgecolor="k", zorder=4,
+               label=f"Perihelio q = {q:.4f} UA")
+ 
+    # Límites que incluyan órbita y ejes
+    xs = np.concatenate([x_orb, [-L, L, -L * u[0], L * u[0], -L * v[0], L * v[0]]])
+    ys = np.concatenate([y_orb, [-L, L, -L * u[1], L * u[1], -L * v[1], L * v[1]]])
+    margen = 0.08 * max(np.ptp(xs), np.ptp(ys))
+    ax.set_xlim(xs.min() - margen, xs.max() + margen)
+    ax.set_ylim(ys.min() - margen, ys.max() + margen)
+ 
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("x [UA]")
+    ax.set_ylabel("y [UA]")
+    ax.set_title(f"Sistema original y sistema rotado en α (mismo origen) — {GRUPO}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower left", fontsize=9)
+ 
+    fig.tight_layout()
+    if guardar_como:
+        fig.savefig(guardar_como, dpi=200)
+    return fig, ax
  
 
 # ----------------------------------------------------------------------------
@@ -280,14 +424,21 @@ def main():
         print("4. Visualizar superficie tridimensional del potencial gravitatorio")
         print("5. Visualizar curvas de nivel del potencial gravitatorio")
         print("6. Graficar campo vectorial asociado al campo gravitatorio")
-        print("Otra opción para salir")
-        opcion = input("Ingrese el número de la opción deseada: ").strip()
+        print("Ingrese cualquier otra opción para salir")
+        opcion = input("Opción deseada: ").strip()
         if opcion == "1":
             graficar_orbita_cartesiana(parametros, x_obs, y_obs) #llamo a la funcion para graficar la orbita cartesiana
             plt.show()
         elif opcion == "2":
             graficar_orbita_polar(parametros, x_obs, y_obs) #llamo a la funcion para graficar la orbita polar
             plt.show()
+        elif opcion == "3":
+            print(f"Ángulo de rotación α = {parametros['alpha_deg']:.4f}°")
+            print(f"Error radial RMS de las observaciones: " f"{error_radial_rms(parametros, x_obs, y_obs):.5f} UA")
+            graficar_sistema_rotado(parametros, x_obs, y_obs) #llamo a la funcion para graficar el sistema rotado
+            plt.show()
+        elif opcion == "4":
+            
         else:
             print("Programa cerrado.")
             break
