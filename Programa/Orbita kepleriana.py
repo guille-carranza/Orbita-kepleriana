@@ -27,7 +27,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Arc
-
+from matplotlib.lines import Line2D
+from matplotlib.colors import to_hex
+from matplotlib.colors import to_hex, LogNorm, LinearSegmentedColormap
 # ----------------------------------------------------------------------------
 # Configuración
 # ----------------------------------------------------------------------------
@@ -41,6 +43,7 @@ GRUPO = "G3"
 # T = 1 año (μ = 4π² a³ / T²). Con él, U(x, y) queda en UA²/año². Cambialo si tu consigna da otro μ.
 MU = 4.0 * np.pi**2
 
+ESCALA_COLORES = "viridis"
 
 # ----------------------------------------------------------------------------
 # Lectura de datos
@@ -162,33 +165,6 @@ def rango_theta(e, n=2000):
         return np.linspace(0.0, 2.0 * np.pi, n)
     theta_max = np.arccos(-1.0 / e)
     return np.linspace(-0.95 * theta_max, 0.95 * theta_max, n)
-
-
-def a_sistema_original(xp, yp, alpha_deg, h, k):
-    """
-    Del sistema rotado (x', y') al original (x, y):  primero se rota en α y luego se traslada a (h, k).
-        x = h + x' cos α − y' sin α
-        y = k + x' sin α + y' cos α
-    """
-    alpha = np.deg2rad(alpha_deg)
-    x = h + xp * np.cos(alpha) - yp * np.sin(alpha)
-    y = k + xp * np.sin(alpha) + yp * np.cos(alpha)
-    return x, y
-
-
-def a_sistema_rotado(x, y, alpha_deg, h, k):
-    """
-    Del sistema original (x, y) al rotado (x', y') con origen en el foco (h, k):  es la inversa de
-    a_sistema_original (se resta (h, k) y se rota en −α). El eje x' apunta al perihelio.
-        x' =  (x − h) cos α + (y − k) sin α
-        y' = −(x − h) sin α + (y − k) cos α
-    """
-    alpha = np.deg2rad(alpha_deg)
-    dx, dy = x - h, y - k
-    xp = dx * np.cos(alpha) + dy * np.sin(alpha)
-    yp = -dx * np.sin(alpha) + dy * np.cos(alpha)
-    return xp, yp
-
 
 def orbita_cartesiana(p, e, alpha_deg, h, k, n=2000):
     """
@@ -339,6 +315,31 @@ def error_radial_rms(parametros, x_obs, y_obs):
     r_modelo = radio_orbita(theta_obs, parametros["p"], parametros["e"])
     return float(np.sqrt(np.mean((r_obs - r_modelo) ** 2)))
 
+def a_sistema_original(xp, yp, alpha_deg, h, k):
+    """
+    Del sistema rotado (x', y') al original (x, y):  primero se rota en α y luego se traslada a (h, k).
+        x = h + x' cos α − y' sin α
+        y = k + x' sin α + y' cos  α
+    """
+    alpha = np.deg2rad(alpha_deg)
+    x = h + xp * np.cos(alpha) - yp * np.sin(alpha)
+    y = k + xp * np.sin(alpha) + yp * np.cos(alpha)
+    return x, y
+
+
+def a_sistema_rotado(x, y, alpha_deg, h, k):
+    """
+    Del sistema original (x, y) al rotado (x', y') con origen en el foco (h, k):  es la inversa de
+    a_sistema_original (se resta (h, k) y se rota en −α). El eje x' apunta al perihelio.
+        x' =  (x − h) cos α + (y − k) sin α
+        y' = −(x − h) sin α + (y − k) cos α
+    """
+    alpha = np.deg2rad(alpha_deg)
+    dx, dy = x - h, y - k
+    xp = dx * np.cos(alpha) + dy * np.sin(alpha)
+    yp = -dx * np.sin(alpha) + dy * np.cos(alpha)
+    return xp, yp
+
 
 def graficar_sistema_rotado(parametros, x_obs, y_obs, guardar_como=None):
     """
@@ -447,74 +448,350 @@ def graficar_sistema_rotado(parametros, x_obs, y_obs, guardar_como=None):
         fig.savefig(guardar_como, dpi=200)
     return fig, ax
 
-
+ #----------------------------------------------------------------------------
+# Centro del potencial (foco) y funciones 4 y 5: potencial gravitatorio
+# ----------------------------------------------------------------------------
+def estimar_foco_observaciones(parametros, x_obs, y_obs, iteraciones=100, tol=1e-12):
+    """
+    Estima el foco "real" (fx, fy) a partir de las 48 observaciones.
+    Se conservan α, p y e de la tabla y solo se ajusta la posición del foco F por mínimos cuadrados
+    (Gauss-Newton). Sale de la ecuación de la órbita:  r + e·x' = p,  con r = |P − F| y x' la
+    componente de (P − F) a lo largo de x' (dirección del perihelio, ángulo α).
+    Devuelve (fx, fy, rms): el foco y el error radial RMS de las observaciones respecto de ese foco.
+    """
+    e, p = parametros["e"], parametros["p"]
+    alpha = np.deg2rad(parametros["alpha_deg"])
+    u = np.array([np.cos(alpha), np.sin(alpha)])               # dirección de x'
+    P = np.column_stack([x_obs, y_obs])
+    F = P.mean(axis=0)                                         # punto de partida: el centro de los datos
+ 
+    for _ in range(iteraciones):
+        d = P - F
+        dist = np.hypot(d[:, 0], d[:, 1])
+        residuo = dist + e * (d @ u) - p                       # = 0 si P está sobre la órbita
+        jacobiano = -(d / dist[:, None] + e * u)               # derivada del residuo respecto de F
+        paso = np.linalg.lstsq(jacobiano, -residuo, rcond=None)[0]
+        F = F + paso
+        if np.linalg.norm(paso) < tol:
+            break
+ 
+    ajustado = dict(parametros, h=float(F[0]), k=float(F[1]))
+    return float(F[0]), float(F[1]), error_radial_rms(ajustado, x_obs, y_obs)
+ 
+ 
+def _centro_potencial(parametros, x_obs, y_obs, centro):
+    """
+    Devuelve (cx, cy): el centro del potencial, que físicamente es el foco (donde está el cuerpo
+    que atrae). centro="observaciones" -> foco estimado con las observaciones (por defecto);
+    centro="tabla" -> el foco (h, k) del CSV de grupos.
+    """
+    h, k = parametros["h"], parametros["k"]
+    if centro == "observaciones":
+        cx, cy, rms = estimar_foco_observaciones(parametros, x_obs, y_obs)
+        print(f"\nCentro del potencial = foco estimado con las observaciones: ({cx:.4f}, {cy:.4f}) UA "
+              f"(error radial RMS = {rms:.5f} UA)")
+        print(f"  Foco de la tabla (h, k) = ({h:.4f}, {k:.4f}) UA; distancia entre ambos: "
+              f"{np.hypot(cx - h, cy - k):.4f} UA")
+    elif centro == "tabla":
+        cx, cy = h, k
+        print(f"\nCentro del potencial = foco de la tabla (h, k) = ({cx:.4f}, {cy:.4f}) UA")
+    else:
+        raise ValueError('centro debe ser "observaciones" o "tabla"')
+    return cx, cy
+ 
+ 
+def potencial_gravitatorio(x, y, mu=MU, centro=(0.0, 0.0)):
+    """
+    U = −μ / r, con r la distancia al 'centro' (el cuerpo atractor, ubicado en el foco):
+    r = sqrt((x − cx)² + (y − cy)²). Con centro = (0, 0) es la fórmula U = −μ/sqrt(x² + y²).
+    Funciona con números y con arreglos de numpy (μ > 0).
+    """
+    with np.errstate(divide="ignore"):          # en el centro devuelve −inf en lugar de fallar
+        return -mu / np.hypot(x - centro[0], y - centro[1])
+ 
+ 
 # ----------------------------------------------------------------------------
 # Función 4: superficie tridimensional del potencial gravitatorio
 # ----------------------------------------------------------------------------
-def potencial_gravitatorio(x, y, mu=MU):
-    """U(x, y) = −μ / sqrt(x² + y²). Funciona con números y con arreglos de numpy (μ > 0)."""
-    with np.errstate(divide="ignore"):          # en (0, 0) devuelve −inf en lugar de fallar
-        return -mu / np.hypot(x, y)
-
-
-def graficar_superficie_potencial(parametros, mu=MU, n=200, guardar_como=None):
+def graficar_superficie_potencial(parametros, x_obs, y_obs, mu=MU, n=200,
+                                  centro="observaciones", guardar_como=None):
     """
-    Superficie z = U(x, y) sobre una grilla cuadrada centrada en el origen, con la órbita
-    "subida" a la superficie (z = U(x_orbita, y_orbita)).
+    Superficie z = U(x, y) con el potencial centrado en el foco (ver _centro_potencial) y las
+    observaciones "subidas" a la superficie (z = U(x_obs, y_obs)), unidas en el orden de observación.
     """
     if mu <= 0:
         raise ValueError("μ debe ser positivo")
-
-    p, e = parametros["p"], parametros["e"]
-    alpha, h, k = parametros["alpha_deg"], parametros["h"], parametros["k"]
-    q, Q = parametros["q"], parametros["Q"]
-
-    # 1) Dominio: cuadrado [−R, R]² algo mayor que la órbita
+ 
+    e, q, Q = parametros["e"], parametros["q"], parametros["Q"]
+    cx, cy = _centro_potencial(parametros, x_obs, y_obs, centro)
+ 
+    # 1) Dominio: cuadrado de lado 2R centrado en el foco, algo mayor que la órbita
     R = 1.3 * (Q if e < 1.0 else 3.0 * q)
-    xs = np.linspace(-R, R, n)                  # n par: la grilla no cae justo en (0, 0)
-    X, Y = np.meshgrid(xs, xs)
-
-    # 2) Potencial en cada punto de la grilla; se recorta un círculo chico en el origen,
-    #    donde U → −∞ y el gráfico quedaría reducido a un pico infinito
+    X, Y = np.meshgrid(cx + np.linspace(-R, R, n), cy + np.linspace(-R, R, n))
+ 
+    # 2) Potencial en la grilla; se recorta un círculo chico en el centro, donde U → −∞
     r_corte = 0.08 * R
-    U = potencial_gravitatorio(X, Y, mu)
-    U = np.where(np.hypot(X, Y) < r_corte, np.nan, U)
-
-    # 3) Órbita sobre la superficie (solo los puntos dentro del dominio y fuera del recorte)
-    x_orb, y_orb = orbita_cartesiana(p, e, alpha, h, k)
-    dentro = (np.abs(x_orb) <= R) & (np.abs(y_orb) <= R) & (np.hypot(x_orb, y_orb) >= r_corte)
-    x_orb, y_orb = x_orb[dentro], y_orb[dentro]
-    z_orb = potencial_gravitatorio(x_orb, y_orb, mu)
-
+    U = potencial_gravitatorio(X, Y, mu, (cx, cy))
+    U = np.where(np.hypot(X - cx, Y - cy) < r_corte, np.nan, U)
     z_min = -mu / r_corte
-    z_orb = z_orb + 0.01 * abs(z_min)           # pequeño desplazamiento para que no quede tapada
-
+ 
+    # 3) Observaciones sobre la superficie (solo las que caen dentro del dominio)
+    dentro = ((np.abs(x_obs - cx) <= R) & (np.abs(y_obs - cy) <= R)
+              & (np.hypot(x_obs - cx, y_obs - cy) >= r_corte))
+    xo, yo = x_obs[dentro], y_obs[dentro]
+    zo = potencial_gravitatorio(xo, yo, mu, (cx, cy)) + 0.01 * abs(z_min)   # leve elevación: no queda tapada
+ 
     # 4) Gráfico
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d", computed_zorder=False)   # respeta zorder
     superficie = ax.plot_surface(X, Y, U, cmap="viridis", alpha=0.85, linewidth=0,
                                  antialiased=True, rstride=2, cstride=2, zorder=1)
-    ax.plot(x_orb, y_orb, z_orb, color="tab:red", lw=2.5, zorder=10,
-            label="Órbita sobre la superficie")
-
+    if len(xo) > 0:
+        # línea que une las observaciones en orden (se cierra con la primera) + los puntos observados
+        ax.plot(np.append(xo, xo[0]), np.append(yo, yo[0]), np.append(zo, zo[0]),
+                color="tab:red", lw=1.8, zorder=10)
+        ax.scatter(xo, yo, zo, color="tab:red", edgecolor="k", s=18, depthshade=False, zorder=11,
+                   label=f"Observaciones ({len(xo)})")
+ 
     ax.set_zlim(z_min, 0.0)
     ax.set_box_aspect((1, 1, 0.6))
     ax.view_init(elev=28, azim=-60)
     ax.set_xlabel("x [UA]")
     ax.set_ylabel("y [UA]")
-    ax.set_zlabel("U(x, y) [UA²/año²]")
-    ax.set_title(f"Potencial gravitatorio U(x, y) = −μ/√(x²+y²),  μ = {mu:.3f} — {GRUPO}")
+    ax.set_zlabel("U [UA²/año²]")
+    ax.set_title(f"Potencial gravitatorio U = −μ/r centrado en el foco ({cx:.3f}, {cy:.3f}),  "
+                 f"μ = {mu:.3f} — {GRUPO}", fontsize=10)
     fig.colorbar(superficie, ax=ax, shrink=0.6, pad=0.1, label="U [UA²/año²]")
     ax.legend(loc="lower left")
-
+ 
+    fig.tight_layout()
+    if guardar_como:
+        fig.savefig(guardar_como, dpi=200)
+    return fig, ax
+ 
+ 
+# ----------------------------------------------------------------------------
+# Función 5: curvas de nivel del potencial gravitatorio
+# ----------------------------------------------------------------------------
+def graficar_curvas_nivel_potencial(parametros, x_obs, y_obs, mu=MU, n=400, n_niveles=8,
+                                    centro="observaciones", guardar_como=None):
+    """
+    Curvas de nivel U = k, con k < 0 (U = −μ/r siempre es negativo), con bandas de color sólido.
+    El potencial está centrado en el foco, así que cada nivel es una circunferencia de radio
+    r = −μ/k centrada en el foco. Cada banda entre dos niveles consecutivos se pinta con un color de
+    ESCALA_COLORES (más oscuro = más profundo = U más negativo). Las observaciones se dibujan en rojo,
+    y los dos niveles que pasan por la observación más cercana y más lejana al foco, en negro punteado.
+    Imprime en consola cada constante k y el color de cada banda.
+    """
+    if mu <= 0:
+        raise ValueError("μ debe ser positivo")
+ 
+    h, k = parametros["h"], parametros["k"]
+    e, q, Q = parametros["e"], parametros["q"], parametros["Q"]
+    cx, cy = _centro_potencial(parametros, x_obs, y_obs, centro)
+ 
+    # 1) Dominio y grilla (centrados en el foco)
+    R = 1.3 * (Q if e < 1.0 else 3.0 * q)
+    X, Y = np.meshgrid(cx + np.linspace(-R, R, n), cy + np.linspace(-R, R, n))
+    U = potencial_gravitatorio(X, Y, mu, (cx, cy))
+ 
+    # 2) Constantes k de las curvas de nivel: se eligen por radio (r = −μ/k) y se convierten a k
+    radios = np.linspace(0.25 * R, R, n_niveles)
+    niveles = np.sort(-mu / radios)                      # k < 0, en orden creciente (lo pide contour)
+ 
+    # 3) Bandas de color: n_niveles + 1 bandas con colores equiespaciados de la escala elegida
+    limites = np.concatenate([[U.min()], niveles, [U.max()]])
+    colores = plt.get_cmap(ESCALA_COLORES)(np.linspace(0.0, 1.0, len(niveles) + 1))
+ 
+    # 4) Observaciones y sus niveles extremos (distancias mínima y máxima al foco)
+    dentro = (np.abs(x_obs - cx) <= R) & (np.abs(y_obs - cy) <= R)
+    xo, yo = x_obs[dentro], y_obs[dentro]
+    r_obs = np.hypot(xo - cx, yo - cy)
+    k_extremos = np.sort(np.array([-mu / r_obs.min(), -mu / r_obs.max()]))
+ 
+    print(f"\nCurvas de nivel U = k   (μ = {mu:.4f} UA³/año², U en UA²/año², k < 0)")
+    print(f"Escala de colores: {ESCALA_COLORES} (oscuro = más profundo, claro = más cerca de U = 0)")
+    for i, color in enumerate(colores):
+        inferior = "−∞" if i == 0 else f"{niveles[i - 1]:.3f}"
+        superior = "0" if i == len(niveles) else f"{niveles[i]:.3f}"
+        print(f"  banda {i + 1}: {inferior:>9s} < U < {superior:>8s}   color {to_hex(color)}")
+    for nivel in niveles:
+        print(f"  k = {nivel:9.3f}   ->  r = −μ/k = {-mu / nivel:.4f} UA")
+    # la observación más cercana al foco tiene el U más negativo (k menor); la más lejana, el k mayor
+    print(f"Niveles de las observaciones: k = {k_extremos[0]:.3f} (r = {r_obs.min():.4f} UA, la más cercana al foco)"
+          f" y k = {k_extremos[1]:.3f} (r = {r_obs.max():.4f} UA, la más lejana)")
+ 
+    # 5) Gráfico
+    fig, ax = plt.subplots(figsize=(9, 8))
+    relleno = ax.contourf(X, Y, U, levels=limites, colors=colores)
+    lineas = ax.contour(X, Y, U, levels=niveles, colors="black", linewidths=0.8, alpha=0.6)
+    etiquetas = ax.clabel(lineas, fmt={nivel: f"k={nivel:.1f}" for nivel in niveles}, fontsize=8)
+    for texto in etiquetas:
+        texto.set_alpha(1.0)                  # el alpha de las líneas no debe aclarar el texto
+        texto.set_color("black")
+        texto.set_bbox(dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1))
+ 
+    extremos = ax.contour(X, Y, U, levels=k_extremos, colors="black", linestyles="--", linewidths=1.8)
+    etiquetas = ax.clabel(extremos, fmt={nivel: f"k={nivel:.2f}" for nivel in k_extremos},
+                          fontsize=8, colors="black")
+    for texto in etiquetas:
+        texto.set_bbox(dict(facecolor="white", alpha=0.85, edgecolor="none", pad=1))
+ 
+    # Observaciones: puntos rojos unidos en el orden de observación (se cierra con la primera)
+    ax.plot(np.append(xo, xo[0]), np.append(yo, yo[0]), color="tab:red", lw=1.8, zorder=6)
+    ax.scatter(xo, yo, s=22, color="tab:red", edgecolor="k", zorder=7)
+    ax.scatter([cx], [cy], marker="o", s=60, color="gold", edgecolor="k", zorder=8)
+    if centro == "observaciones":
+        ax.scatter([h], [k], marker="X", s=70, color="white", edgecolor="k", zorder=8)
+ 
+    barra = fig.colorbar(relleno, ax=ax, ticks=niveles, format="%.1f", shrink=0.8, pad=0.03)
+    barra.set_label(f"Profundidad: U = k [UA²/año²]  (escala {ESCALA_COLORES}: más oscuro = más profundo)")
+ 
+    ax.set_aspect("equal")
+    ax.set_xlabel("x [UA]")
+    ax.set_ylabel("y [UA]")
+    ax.set_title(f"Curvas de nivel del potencial U = k < 0 centrado en el foco,  μ = {mu:.3f} — {GRUPO}",
+                 fontsize=11)
+ 
+    leyenda = [
+        Line2D([], [], color="black", lw=0.8, label="Curvas de nivel U = k (k < 0)"),
+        Line2D([], [], color="black", lw=1.8, ls="--", label="Niveles extremos de las observaciones"),
+        Line2D([], [], color="tab:red", lw=1.8, marker="o", mec="k", label=f"Observaciones ({len(xo)})"),
+        Line2D([], [], color="gold", marker="o", mec="k", ls="",
+               label=f"Centro del potencial = foco ({cx:.3f}, {cy:.3f})"),
+    ]
+    if centro == "observaciones":
+        leyenda.append(Line2D([], [], color="white", marker="X", mec="k", ls="",
+                              label=f"Foco de la tabla (h, k) = ({h:.3f}, {k:.3f})"))
+    ax.legend(handles=leyenda, loc="lower left", fontsize=9, framealpha=0.9)
+ 
     fig.tight_layout()
     if guardar_como:
         fig.savefig(guardar_como, dpi=200)
     return fig, ax
 
 
+#----------------------------------------------------------------------------
+#Funcion para graficar el campo vectorial
+#----------------------------------------------------------------------------
+
+def campo_gravitatorio(x, y, mu=MU, centro=(0.0, 0.0)):
+    """
+    Campo gravitatorio F = −∇U para U = −μ/r, con r = sqrt((x − cx)² + (y − cy)²):
+        ∇U = μ (x − cx, y − cy) / r³        ->        F = −μ (x − cx, y − cy) / r³
+    Es radial, apunta hacia el centro (el foco) y su norma es |F| = μ / r².
+    Devuelve las componentes (Fx, Fy). En el centro no está definido (r = 0).
+    """
+    dx, dy = x - centro[0], y - centro[1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r3 = np.hypot(dx, dy) ** 3
+        return -mu * dx / r3, -mu * dy / r3
+ 
+def graficar_campo_vectorial(parametros, x_obs, y_obs, mu=MU, n_flechas=18,
+                             centro="observaciones", guardar_como=None):
+    """
+    Dos paneles:
+      - Izquierda: campo F = −∇U en una grilla de n_flechas × n_flechas puntos. Todas las flechas
+        miden lo mismo (muestran solo la DIRECCIÓN); el COLOR indica la norma |F| (escala log).
+      - Derecha: la norma |F| = μ/r² en función de la distancia r al foco, con el rango de r que
+        recorren las observaciones.
+    """
+    if mu <= 0:
+        raise ValueError("μ debe ser positivo")
+ 
+    h, k = parametros["h"], parametros["k"]
+    e, q, Q = parametros["e"], parametros["q"], parametros["Q"]
+    cx, cy = _centro_potencial(parametros, x_obs, y_obs, centro)
+ 
+    # 1) Dominio y grilla de flechas, centrados en el foco (n_flechas par: ningún punto cae en el foco)
+    R = 1.3 * (Q if e < 1.0 else 3.0 * q)
+    paso = 2.0 * R / n_flechas
+    puntos = cx + (np.arange(n_flechas) + 0.5) * paso - R
+    puntos_y = cy + (np.arange(n_flechas) + 0.5) * paso - R
+    X, Y = np.meshgrid(puntos, puntos_y)
+ 
+    # 2) Campo en la grilla: norma y dirección (vector unitario)
+    Fx, Fy = campo_gravitatorio(X, Y, mu, (cx, cy))
+    norma = np.hypot(Fx, Fy)
+    ux, uy = Fx / norma, Fy / norma                       # solo la dirección: todas las flechas miden igual
+ 
+    # 3) Observaciones: distancias al foco y norma del campo en ellas
+    r_obs = np.hypot(x_obs - cx, y_obs - cy)
+    F_obs = mu / r_obs**2
+ 
+    print(f"\nCampo vectorial F = −∇U = −μ (x − cx, y − cy)/r³,  |F| = μ/r²   (μ = {mu:.4f} UA³/año²)")
+    print(f"  Dirección: radial hacia el foco ({cx:.4f}, {cy:.4f}).  Norma en la grilla: "
+          f"de {norma.min():.2f} (más lejos) a {norma.max():.2f} UA/año² (más cerca)")
+    print(f"  Norma en las observaciones: de {F_obs.min():.3f} (r = {r_obs.max():.4f} UA) "
+          f"a {F_obs.max():.3f} UA/año² (r = {r_obs.min():.4f} UA)")
+ 
+    # 4) Escala de colores: viridis invertida y recortada (sin el amarillo más claro, que no se vería
+    #    sobre fondo blanco): oscuro = norma grande (cerca del foco), claro = norma chica (lejos)
+    cmap = LinearSegmentedColormap.from_list(
+        "viridis_r_recortada", plt.get_cmap(ESCALA_COLORES + "_r")(np.linspace(0.15, 1.0, 256)))
+    norm = LogNorm(vmin=norma.min(), vmax=norma.max())
+ 
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(14, 7), gridspec_kw={"width_ratios": [1.8, 1]})
+ 
+    # --- Panel izquierdo: campo de direcciones coloreado por la norma
+    largo = 0.6 * paso                                    # largo de TODAS las flechas (en UA)
+    flechas = ax.quiver(X, Y, ux, uy, norma, cmap=cmap, norm=norm, angles="xy",
+                        scale_units="xy", scale=1.0 / largo, pivot="mid", width=0.004)
+    ax.plot(np.append(x_obs, x_obs[0]), np.append(y_obs, y_obs[0]), color="tab:red", lw=1.5, zorder=5)
+    ax.scatter(x_obs, y_obs, s=18, color="tab:red", edgecolor="k", zorder=6)
+    ax.scatter([cx], [cy], marker="o", s=70, color="gold", edgecolor="k", zorder=8)
+    if centro == "observaciones":
+        ax.scatter([h], [k], marker="X", s=70, color="white", edgecolor="k", zorder=8)
+ 
+    barra = fig.colorbar(flechas, ax=ax, shrink=0.8, pad=0.02)
+    barra.set_label("|F| = μ/r²  [UA/año²]   (escala logarítmica; oscuro = intenso, claro = débil)")
+    ax.set_xlim(cx - R, cx + R)
+    ax.set_ylim(cy - R, cy + R)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x [UA]")
+    ax.set_ylabel("y [UA]")
+    ax.set_title("Campo F = −∇U: dirección (flechas) y norma (color)", fontsize=11)
+    ax.grid(True, alpha=0.3)
+    leyenda = [
+        Line2D([], [], color="0.35", marker=r"$\rightarrow$", ls="", ms=12,
+               label="Dirección de F (mismo largo en todas)"),
+        Line2D([], [], color="tab:red", lw=1.5, marker="o", mec="k", label=f"Observaciones ({len(x_obs)})"),
+        Line2D([], [], color="gold", marker="o", mec="k", ls="",
+               label=f"Foco = centro del potencial ({cx:.3f}, {cy:.3f})"),
+    ]
+    if centro == "observaciones":
+        leyenda.append(Line2D([], [], color="white", marker="X", mec="k", ls="",
+                              label=f"Foco de la tabla (h, k) = ({h:.3f}, {k:.3f})"))
+    ax.legend(handles=leyenda, loc="lower left", fontsize=8, framealpha=0.9)
+ 
+    # --- Panel derecho: norma en función de la distancia al foco
+    r = np.linspace(0.08 * R, np.sqrt(2.0) * R, 400)
+    F_r = mu / r**2
+    ax2.plot(r, F_r, color="0.5", lw=1, zorder=1)
+    ax2.scatter(r, F_r, c=F_r, cmap=cmap, norm=norm, s=14, zorder=2)
+    ax2.axvspan(r_obs.min(), r_obs.max(), color="tab:red", alpha=0.25,
+                label=f"r de las observaciones ({r_obs.min():.3f} a {r_obs.max():.3f} UA)")
+    ax2.scatter([r_obs.min(), r_obs.max()], [F_obs.max(), F_obs.min()], color="tab:red",
+                edgecolor="k", zorder=3)
+    ax2.annotate(f"{F_obs.max():.1f}", (r_obs.min(), F_obs.max()), xytext=(-34, 8),
+                 textcoords="offset points", color="tab:red", fontsize=9)
+    ax2.annotate(f"{F_obs.min():.1f}", (r_obs.max(), F_obs.min()), xytext=(8, 8),
+                 textcoords="offset points", color="tab:red", fontsize=9)
+    ax2.set_yscale("log")
+    ax2.set_xlabel("r = distancia al foco [UA]")
+    ax2.set_ylabel("|F| [UA/año²]")
+    ax2.set_title("Norma del campo: |F| = μ/r²", fontsize=11)
+    ax2.grid(True, which="both", alpha=0.3)
+    ax2.legend(loc="upper right", fontsize=8)
+ 
+    fig.suptitle(f"Campo vectorial asociado a −∇U(x, y) — {GRUPO}", fontsize=13)
+    fig.tight_layout()
+    if guardar_como:
+        fig.savefig(guardar_como, dpi=200)
+    return fig, (ax, ax2)
+
 # ----------------------------------------------------------------------------
-# Programa principal
+# MAIN
 # ----------------------------------------------------------------------------
 def main():
     parametros = cargar_parametros() #arreglo de parametros
@@ -530,7 +807,7 @@ def main():
         print("4. Visualizar superficie tridimensional del potencial gravitatorio")
         print("5. Visualizar curvas de nivel del potencial gravitatorio")
         print("6. Graficar campo vectorial asociado al campo gravitatorio")
-        print("Ingrese cualquier otra opción para salir")
+        print("Ingrese cualquier otro carácter para salir")
         opcion = input("Opción deseada: ").strip()
         if opcion == "1":
             graficar_orbita_cartesiana(parametros, x_obs, y_obs) #llamo a la funcion para graficar la orbita cartesiana
@@ -544,7 +821,28 @@ def main():
             graficar_sistema_rotado(parametros, x_obs, y_obs) #llamo a la funcion para graficar el sistema rotado
             plt.show()
         elif opcion == "4":
-            graficar_superficie_potencial(parametros) #llamo a la funcion para graficar la superficie del potencial gravitatorio
+            print("Elija si quiere tener como centro el foco de la tabla o las observaciones (se debe tener en cuenta que el de la tabla es inconsistente con las observaciones realizadas):")
+            cen=input("Ingrese 'tabla' o 'observaciones': ").strip().lower()
+            if(cen != "tabla" and cen != "observaciones"):
+                print("Opción inválida. Se usará 'observaciones' por defecto.")
+                cen = "observaciones"
+            graficar_superficie_potencial(parametros, x_obs, y_obs, centro=cen) #llamo a la funcion para graficar la superficie del potencial gravitatorio
+            plt.show()
+        elif opcion == "5":
+            print("Elija si quiere tener como centro el foco de la tabla o las observaciones (se debe tener en cuenta que el de la tabla es inconsistente con las observaciones realizadas):")
+            cen=input("Ingrese 'tabla' o 'observaciones': ").strip().lower()
+            if(cen != "tabla" and cen != "observaciones"):
+                print("Opción inválida. Se usará 'observaciones' por defecto.")
+                cen = "observaciones"
+            graficar_curvas_nivel_potencial(parametros, x_obs, y_obs, centro=cen) #llamo a la funcion para graficar las curvas de nivel del potencial gravitatorio
+            plt.show()
+        elif opcion == "6":
+            print("Elija si quiere tener como centro el foco de la tabla o las observaciones (se debe tener en cuenta que el de la tabla es inconsistente con las observaciones realizadas):")
+            cen=input("Ingrese 'tabla' o 'observaciones': ").strip().lower()
+            if(cen != "tabla" and cen != "observaciones"):
+                 print("Opción inválida. Se usará 'observaciones' por defecto.")
+                 cen = "observaciones"
+            graficar_campo_vectorial(parametros, x_obs, y_obs, centro=cen) #llamo a la funcion para graficar el campo vectorial asociado al campo gravitatorio
             plt.show()
         else:
             print("Programa cerrado.")
